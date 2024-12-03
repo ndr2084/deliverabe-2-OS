@@ -13,6 +13,7 @@
 #include <pthread.h>
 #include <time.h>
 #include "errors.h"
+#include <semaphore.h>
 
 /*
  * The "alarm" structure now contains the time_t (time since the
@@ -24,26 +25,33 @@
 typedef struct alarm_tag {
     struct alarm_tag    *link;
     int                 seconds;
+    int                 id_alarm;
+    int                 id_group;
+    char                message[128];
     time_t              time;   /* seconds from EPOCH */
-    char                message[64];
+
+
 } alarm_t;
 
 pthread_mutex_t alarm_mutex = PTHREAD_MUTEX_INITIALIZER;
 pthread_cond_t alarm_cond = PTHREAD_COND_INITIALIZER;
 alarm_t *alarm_list = NULL;
 time_t current_alarm = 0;
+sem_t sem_start_alarm;
+sem_t sem_display_threads;
 
 /*
  * Insert alarm entry on list, in order.
  */
 void alarm_insert (alarm_t *alarm)
 {
+    pthread_t thread_id_main = pthread_self();
     int status;
     alarm_t **last, *next;
 
     /*
      * LOCKING PROTOCOL:
-     * 
+     *
      * This routine requires that the caller have locked the
      * alarm_mutex!
      */
@@ -67,6 +75,8 @@ void alarm_insert (alarm_t *alarm)
         *last = alarm;
         alarm->link = NULL;
     }
+    printf("Alarm(%d) Inserted by Main Thread %lu"
+           " Into Alarm List at %ld: Group(%d) %d %s\n", alarm->id_alarm, thread_id_main, alarm->time, alarm->id_group, alarm->seconds, alarm->message);
 #ifdef DEBUG
     printf ("[list: ");
     for (next = alarm_list; next != NULL; next = next->link)
@@ -83,15 +93,14 @@ void alarm_insert (alarm_t *alarm)
     if (current_alarm == 0 || alarm->time < current_alarm) {
         current_alarm = alarm->time;
         status = pthread_cond_signal (&alarm_cond);
-        if (status != 0)
-            err_abort (status, "Signal cond");
+        if (status != 0) err_abort (status, "Signal cond");
     }
 }
 
 /*
  * The alarm thread's start routine.
  */
-void *alarm_thread (void *arg)
+void *alarm_group_display_creation (void *arg)
 {
     alarm_t *alarm;
     struct timespec cond_time;
@@ -104,7 +113,7 @@ void *alarm_thread (void *arg)
      * at the start -- it will be unlocked during condition
      * waits, so the main thread can insert alarms.
      */
-    status = pthread_mutex_lock (&alarm_mutex);
+    status = pthread_mutex_lock (&alarm_mutex); //LOCK MUTEX
     if (status != 0)
         err_abort (status, "Lock mutex");
     while (1) {
@@ -116,9 +125,8 @@ void *alarm_thread (void *arg)
         current_alarm = 0;
         while (alarm_list == NULL) {
             status = pthread_cond_wait (&alarm_cond, &alarm_mutex);
-            if (status != 0)
-                err_abort (status, "Wait on cond");
-            }
+            if (status != 0) err_abort (status, "Wait on cond");
+        }
         alarm = alarm_list;
         alarm_list = alarm->link;
         now = time (NULL);
@@ -152,44 +160,98 @@ void *alarm_thread (void *arg)
     }
 }
 
+void alarm_change (alarm_t *alarm){}
+
+void alarm_cancel (alarm_t *alarm){}
+
+void alarm_suspend (alarm_t *alarm){}
+
+void alarm_reactivate (alarm_t *alarm){}
+
+void alarm_view (void){}
+
+
+void *alarm_group_display_removal (void *arg) {
+}
+
+
+int input_validator(const char *keyword_action, const char *keyword_group, int user_arg ) {
+    //if input is valid, return flag that corresponds to the keyword
+    if((strcmp(keyword_action, "Cancel_Alarm") == 0) && (user_arg == 2)) {
+        return 1;
+    }
+    if((strcmp(keyword_action, "View_Alarms") == 0) && (user_arg == 1)) {
+        return 2;
+    }
+    if((strcmp(keyword_action, "Start_Alarm") == 0) && strcmp(keyword_group, "Group") == 0 && (user_arg == 6)) {
+        return 3;
+    }
+    if((strcmp(keyword_action, "Change_Alarm") == 0) && strcmp(keyword_group, "Group") == 0 && (user_arg == 6)) {
+        return 4;
+    }
+    if((strcmp(keyword_action, "Suspend_Alarm") == 0) && (user_arg == 2)) {
+        return 5;
+    }
+    if((strcmp(keyword_action, "Reactivate_Alarm") == 0) && (user_arg == 2)) {
+        return 6;
+    }
+
+    err_abort (69, "command not found");
+}
+
 int main (int argc, char *argv[])
 {
     int status;
+    int action;
     char line[128];
     alarm_t *alarm;
-    pthread_t thread;
+    pthread_t thread_alarm_group_display_creation;
+    pthread_t thread_alarm_group_display_removal;
+    char keyword_action[128];
+    char keyword_group[128];
+    sem_init(&sem_display_threads, 0, 0);
 
-    status = pthread_create (&thread, NULL, alarm_thread, NULL);
+    status = pthread_create (&thread_alarm_group_display_creation, NULL, alarm_group_display_creation, NULL);
     if (status != 0)
-        err_abort (status, "Create alarm thread");
+        err_abort (status, "alarm group display creation");
+
+    status = pthread_create (&thread_alarm_group_display_removal, NULL, alarm_group_display_removal, NULL);
+    if (status != 0)
+        err_abort (status, "alarm group display removal");
+
+
     while (1) {
         printf ("Alarm> ");
         if (fgets (line, sizeof (line), stdin) == NULL) exit (0);
         if (strlen (line) <= 1) continue;
         alarm = (alarm_t*)malloc (sizeof (alarm_t));
-        if (alarm == NULL)
-            errno_abort ("Allocate alarm");
+        if (alarm == NULL){errno_abort ("Allocate alarm");}
 
         /*
          * Parse input line into seconds (%d) and a message
          * (%64[^\n]), consisting of up to 64 characters
          * separated from the seconds by whitespace.
          */
-        if (sscanf (line, "%d %64[^\n]", 
-            &alarm->seconds, alarm->message) < 2) {
+        int user_arg = (sscanf (line, "%[^(\n](%d): %[^(\n](%d)%d %128[^\n]", keyword_action, &alarm->id_alarm, keyword_group,
+            &alarm->id_group, &alarm->seconds, alarm->message));
+
+        if (user_arg == -1 == -1 || alarm->id_alarm < 1 || alarm->id_group < 1) {
             fprintf (stderr, "Bad command\n");
             free (alarm);
-        } else {
-            //critical begin
-            status = pthread_mutex_lock (&alarm_mutex);
-            if (status != 0) {err_abort (status, "Lock mutex");}
+
+        }
+        else {
+            input_validator(keyword_action, keyword_group, user_arg);
+            //CRITICAL BEGIN
+            status = pthread_mutex_lock (&alarm_mutex); if (status != 0){err_abort (status, "Lock mutex");}
 
             alarm->time = time (NULL) + alarm->seconds;
-            alarm_insert (alarm); //Insert the new alarm into the list of alarms, sorted by expiration time.
 
-            //critical end
-            status = pthread_mutex_unlock (&alarm_mutex);
-            if (status != 0) {err_abort (status, "Unlock mutex");}
+            alarm_insert (alarm);
+            //CRITICAL END
+            status = pthread_mutex_unlock (&alarm_mutex); if (status != 0){err_abort (status, "Unlock mutex");}
+            alarm_group_display_creation(alarm);
+            sem_wait(&sem_display_threads);
         }
     }
 }
